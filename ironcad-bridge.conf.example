@@ -1,0 +1,15 @@
+# IronCAD SDR bridge settings.
+#
+# Get both required values from IronCAD:
+#   Settings -> Agency radio receiver -> Issue ingest key
+# The key is shown once. If you lose it, rotate it there; that revokes the old
+# one immediately.
+
+IRONCAD_AGENCY_ID=
+IRONCAD_INGEST_KEY=
+
+# Optional.
+# SITE_LABEL=Station 3 roof
+# SDR_BASE_URL=http://127.0.0.1:5051
+# IRONCAD_API=https://api.ironcad.tech
+# POLL_SECONDS=10
