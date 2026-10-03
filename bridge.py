@@ -29,17 +29,29 @@ WHAT IT SENDS
     aircraft      locally received ADS-B
     weather       433 MHz weather-sensor telemetry
 
-USAGE
-    pip install requests
-    export IRONCAD_AGENCY_ID=...        # shown in IronCAD settings
-    export IRONCAD_INGEST_KEY=...       # issued once in IronCAD settings
-    python bridge.py
+RUNNING IT
+    The packaged IronCAD-Bridge.exe opens a window (see ui.py). This module is
+    the engine underneath that window, and it also runs on its own, which is what
+    a service manager should use:
 
-    Optional:
-      SDR_BASE_URL     default http://127.0.0.1:5051
-      IRONCAD_API      default https://api.ironcad.tech
-      SITE_LABEL       e.g. "Station 3 roof"
-      POLL_SECONDS     default 10
+        pip install requests
+        export IRONCAD_AGENCY_ID=...    # shown in IronCAD settings
+        export IRONCAD_INGEST_KEY=...   # issued once in IronCAD settings
+        python bridge.py
+
+    Optional: SDR_BASE_URL (default http://127.0.0.1:5051), IRONCAD_API
+    (default https://api.ironcad.tech), SITE_LABEL, POLL_SECONDS (default 10,
+    minimum 5).
+
+    Settings also come from ironcad-bridge.conf beside the program. Environment
+    variables win over the file, so a service deployment that exports them is
+    unaffected and never reads it.
+
+THE WINDOW AND THE CONSOLE SHARE ONE LOOP
+    run_loop() below is the only implementation of the poll cycle. The console
+    path and the window both drive it and differ only in what they do with the
+    events it emits. A second copy of this loop behind a GUI is a second copy
+    that drifts, and the one that drifts is always the one nobody is watching.
 """
 
 import json
@@ -80,15 +92,33 @@ IRONCAD_INGEST_KEY=
 # POLL_SECONDS=10
 """
 
+DEFAULTS = {
+    "IRONCAD_AGENCY_ID": "",
+    "IRONCAD_INGEST_KEY": "",
+    "SITE_LABEL": "",
+    "SDR_BASE_URL": "http://127.0.0.1:5051",
+    "IRONCAD_API": "https://api.ironcad.tech",
+    "POLL_SECONDS": "10",
+}
 
-def read_config_file(path):
+# Read endpoints only. Nothing here can key a transmitter.
+ENDPOINTS = {
+    "aprs": "api/v1/aprs/stations",
+    "aircraft": "api/v1/adsb/aircraft",
+    "weather": "api/v1/weather/sensors",
+}
+
+LOCAL_TIMEOUT = 8
+PUSH_TIMEOUT = 20
+MIN_POLL_SECONDS = 5
+
+
+def read_config_file(path=CONFIG_PATH):
     """
     Read KEY=VALUE lines from the settings file beside the program.
 
-    Environment variables still win, so an existing deployment that exports them
-    behaves exactly as before and this file is simply never consulted. Anything
-    unreadable is treated as absent rather than fatal: the operator gets the
-    missing-settings message, which tells them what to do, instead of a stack
+    Anything unreadable is treated as absent rather than fatal: the operator gets
+    the missing-settings message, which tells them what to do, instead of a stack
     trace about a file they may not know exists.
     """
     values = {}
@@ -102,66 +132,95 @@ def read_config_file(path):
                 values[key.strip()] = value.strip().strip('"').strip("'")
     except FileNotFoundError:
         return {}
-    except OSError as exc:
-        print(f"could not read {path}: {exc}", flush=True)
+    except OSError:
         return {}
     return values
 
 
-FILE_CONFIG = read_config_file(CONFIG_PATH)
+def write_config_file(values, path=CONFIG_PATH):
+    """
+    Write the settings file, keeping the explanatory header.
+
+    Only non-empty optional values are written uncommented, so a file saved from
+    the window still reads like the template a person would edit by hand.
+    """
+    lines = [
+        "# IronCAD SDR bridge settings.",
+        "#",
+        "# Get both required values from IronCAD:",
+        "#   Settings -> Agency radio receiver -> Issue ingest key",
+        "# The key is shown once. If you lose it, rotate it there; that revokes",
+        "# the old one immediately.",
+        "#",
+        "# Environment variables of the same names override this file.",
+        "",
+        f"IRONCAD_AGENCY_ID={values.get('IRONCAD_AGENCY_ID', '').strip()}",
+        f"IRONCAD_INGEST_KEY={values.get('IRONCAD_INGEST_KEY', '').strip()}",
+        "",
+    ]
+    for key in ("SITE_LABEL", "SDR_BASE_URL", "IRONCAD_API", "POLL_SECONDS"):
+        val = str(values.get(key, "")).strip()
+        if val and val != DEFAULTS[key]:
+            lines.append(f"{key}={val}")
+        else:
+            lines.append(f"# {key}={val or DEFAULTS[key]}")
+    lines.append("")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines))
 
 
-def setting(name, default=""):
-    """Environment first, then the settings file, then the default."""
-    from_env = os.environ.get(name)
-    if from_env is not None and from_env.strip():
-        return from_env.strip()
-    return FILE_CONFIG.get(name, default).strip()
+def build_config(overrides=None, path=CONFIG_PATH, env=None):
+    """
+    Resolve settings: explicit overrides, then environment, then the file,
+    then defaults.
+
+    Overrides come first so the window can run with what is on screen before the
+    operator has saved it. Environment still beats the file, which is what keeps
+    an existing service deployment behaving exactly as it did.
+    """
+    env = os.environ if env is None else env
+    from_file = read_config_file(path)
+    overrides = overrides or {}
+
+    def pick(key):
+        if key in overrides and str(overrides[key]).strip():
+            return str(overrides[key]).strip()
+        from_env = env.get(key)
+        if from_env is not None and from_env.strip():
+            return from_env.strip()
+        if from_file.get(key, "").strip():
+            return from_file[key].strip()
+        return DEFAULTS[key]
+
+    try:
+        poll = max(MIN_POLL_SECONDS, int(pick("POLL_SECONDS")))
+    except (TypeError, ValueError):
+        poll = int(DEFAULTS["POLL_SECONDS"])
+
+    return {
+        "agency_id": pick("IRONCAD_AGENCY_ID"),
+        "ingest_key": pick("IRONCAD_INGEST_KEY"),
+        "site_label": pick("SITE_LABEL") or None,
+        "sdr_base": pick("SDR_BASE_URL").rstrip("/") + "/",
+        "api": pick("IRONCAD_API").rstrip("/"),
+        "poll_seconds": poll,
+    }
 
 
-SDR_BASE = setting("SDR_BASE_URL", "http://127.0.0.1:5051").rstrip("/") + "/"
-IRONCAD_API = setting("IRONCAD_API", "https://api.ironcad.tech").rstrip("/")
-AGENCY_ID = setting("IRONCAD_AGENCY_ID")
-INGEST_KEY = setting("IRONCAD_INGEST_KEY")
-SITE_LABEL = setting("SITE_LABEL") or None
-try:
-    POLL_SECONDS = max(5, int(setting("POLL_SECONDS", "10")))
-except ValueError:
-    POLL_SECONDS = 10
-
-# Read endpoints only. Nothing here can key a transmitter.
-ENDPOINTS = {
-    "aprs": "api/v1/aprs/stations",
-    "aircraft": "api/v1/adsb/aircraft",
-    "weather": "api/v1/weather/sensors",
-}
-
-LOCAL_TIMEOUT = 8
-PUSH_TIMEOUT = 20
-
-_running = True
+def is_configured(cfg):
+    return bool(cfg.get("agency_id")) and bool(cfg.get("ingest_key"))
 
 
-def _stop(_signum, _frame):
-    global _running
-    _running = False
-    print("stopping after the current cycle...", flush=True)
-
-
-signal.signal(signal.SIGINT, _stop)
-signal.signal(signal.SIGTERM, _stop)
-
-
-def get_local(path):
+def get_local(cfg, path, emit):
     """Read one appliance endpoint. A decoder that is off is not an error."""
     try:
-        res = requests.get(urljoin(SDR_BASE, path), timeout=LOCAL_TIMEOUT)
+        res = requests.get(urljoin(cfg["sdr_base"], path), timeout=LOCAL_TIMEOUT)
         if res.status_code == 404:
             return None
         res.raise_for_status()
         return res.json()
     except Exception as exc:  # noqa: BLE001 - any local failure is just "no data"
-        print(f"  local {path}: {exc}", flush=True)
+        emit("error", f"  local {path}: {exc}")
         return None
 
 
@@ -201,135 +260,216 @@ def collect_packets(aprs_payload):
     return packets[:500]
 
 
-def push(body):
+def push(cfg, body):
     headers = {
         "Content-Type": "application/json",
-        "X-IronCAD-Agency": AGENCY_ID,
-        "Authorization": f"Bearer {INGEST_KEY}",
+        "X-IronCAD-Agency": cfg["agency_id"],
+        "Authorization": f"Bearer {cfg['ingest_key']}",
     }
-    res = requests.post(
-        f"{IRONCAD_API}/api/sdr/ingest",
+    return requests.post(
+        f"{cfg['api']}/api/sdr/ingest",
         headers=headers,
         data=json.dumps(body),
         timeout=PUSH_TIMEOUT,
     )
-    return res
 
 
-def cycle():
-    aprs = get_local(ENDPOINTS["aprs"])
-    aircraft = get_local(ENDPOINTS["aircraft"])
-    weather = get_local(ENDPOINTS["weather"])
+def cycle(cfg, emit):
+    """
+    One poll of the appliance and one push to IronCAD.
+
+    Returns the server's counts on success, or None. An empty push is still
+    worth sending: it is how IronCAD knows the receiver is alive and hearing
+    nothing, which is a different thing from a receiver that has died.
+    Suppressing it would make a healthy quiet night look like an outage.
+    """
+    aprs = get_local(cfg, ENDPOINTS["aprs"], emit)
+    aircraft = get_local(cfg, ENDPOINTS["aircraft"], emit)
+    weather = get_local(cfg, ENDPOINTS["weather"], emit)
 
     body = {
-        "site": SITE_LABEL,
+        "site": cfg["site_label"],
         "observed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "aprs_packets": collect_packets(aprs),
         "aircraft": as_list(aircraft, "aircraft", "results"),
         "weather": as_list(weather, "sensors", "results"),
     }
 
-    # An empty push is still worth sending: it is how IronCAD knows the receiver
-    # is alive and hearing nothing, which is a different thing from a receiver
-    # that has died. Suppressing it would make a healthy quiet night look like an
-    # outage.
-    res = push(body)
+    res = push(cfg, body)
     if res.status_code == 401:
-        print("  push rejected: check IRONCAD_AGENCY_ID and IRONCAD_INGEST_KEY", flush=True)
-        return
+        emit("error", "  push rejected: check the agency ID and the ingest key")
+        return None
     if res.status_code == 422:
         # The server refuses transmit payloads. Reaching this means the appliance
         # returned something this bridge should never have forwarded.
-        print(f"  push refused: {res.text[:200]}", flush=True)
-        return
+        emit("error", f"  push refused: {res.text[:200]}")
+        return None
     if not res.ok:
-        print(f"  push failed {res.status_code}: {res.text[:200]}", flush=True)
-        return
+        emit("error", f"  push failed {res.status_code}: {res.text[:200]}")
+        return None
 
-    counts = (res.json() or {}).get("counts", {})
-    print(
+    counts = (res.json() or {}).get("counts", {}) or {}
+    emit(
+        "ok",
         "  ok  aprs {heard} heard / {pos} positions, aircraft {ac}, weather {wx}".format(
             heard=counts.get("aprs_heard", 0),
             pos=counts.get("aprs_positions", 0),
             ac=counts.get("aircraft", 0),
             wx=counts.get("weather", 0),
         ),
-        flush=True,
     )
+    return counts
+
+
+def run_loop(cfg, emit, should_stop, on_counts=None, sleep=time.sleep):
+    """
+    The poll loop. The console and the window both drive this one function.
+
+    emit(level, text)   level is info, ok, warn or error
+    should_stop()       truthy to finish after the current cycle
+    on_counts(counts)   called with the server's counts after a successful push,
+                        and with None when a cycle failed, so a caller can show
+                        live figures without parsing the log text
+    """
+    emit("info", f"IronCAD SDR bridge - {cfg['sdr_base']} -> {cfg['api']} every {cfg['poll_seconds']}s")
+    emit("info", "receive only; transmit apps are never read")
+
+    backoff = cfg["poll_seconds"]
+    while not should_stop():
+        started = time.time()
+        try:
+            counts = cycle(cfg, emit)
+            backoff = cfg["poll_seconds"]
+            if on_counts:
+                on_counts(counts)
+        except requests.RequestException as exc:
+            # A flapping uplink must not turn into a tight retry loop against a
+            # rate-limited endpoint, so failures back off to a ceiling.
+            emit("error", f"  cycle failed: {exc}")
+            backoff = min(backoff * 2, 300)
+            if on_counts:
+                on_counts(None)
+        elapsed = time.time() - started
+        for _ in range(int(max(1, backoff - elapsed))):
+            if should_stop():
+                break
+            sleep(1)
+
+    emit("info", "stopped.")
+
+
+# --------------------------------------------------------------------------
+# Console entry point. The packaged .exe opens the window instead; see ui.py.
+# --------------------------------------------------------------------------
+
+_stopped = False
+
+
+def _signal_stop(_signum, _frame):
+    global _stopped
+    _stopped = True
+    print("stopping after the current cycle...", flush=True)
+
+
+def console_emit(level, text):
+    print(text, flush=True)
+
+
+LOG_NAME = "ironcad-bridge.log"
+LOG_PATH = os.path.join(BASE_DIR, LOG_NAME)
+
+
+def make_log_emit(path=LOG_PATH):
+    """
+    Emit to a file instead of the console.
+
+    A windowed build has no stdout at all, so a station that falls back to
+    headless there would otherwise run completely silently. Lines handed to an
+    emit never carry the ingest key, so the log does not either.
+    """
+
+    def log_emit(level, text):
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(f"{stamp} {level} {text}\n")
+        except OSError:
+            pass
+
+    return log_emit
 
 
 def halt(message, code=1):
     """
     Stop with an explanation the operator can actually read.
 
-    Double-clicking the packaged .exe opens a console window that closes the
-    instant the process ends, so an error printed and exited normally is an
-    error nobody sees - the program just appears to do nothing. When frozen,
-    wait for a keypress first.
+    Double-clicking a console build opens a window that closes the instant the
+    process ends, so an error printed and exited normally is an error nobody
+    sees - the program just appears to do nothing. When frozen, wait for a
+    keypress first.
     """
     print(message, flush=True)
-    if FROZEN:
+    if FROZEN and sys.stdin is not None:
         print("", flush=True)
         try:
             input("Press Enter to close...")
-        except (EOFError, KeyboardInterrupt):
+        except (EOFError, KeyboardInterrupt, RuntimeError, OSError):
             pass
     sys.exit(code)
 
 
-def main():
-    if not AGENCY_ID or not INGEST_KEY:
-        created = False
-        if not os.path.exists(CONFIG_PATH):
-            try:
-                with open(CONFIG_PATH, "w", encoding="utf-8") as handle:
-                    handle.write(CONFIG_TEMPLATE)
-                created = True
-            except OSError as exc:
-                print(f"could not write {CONFIG_PATH}: {exc}", flush=True)
-        lines = [
-            "IronCAD SDR bridge is not configured yet.",
-            "",
-            "It needs your agency ID and an ingest key, both from IronCAD:",
-            "  Settings -> Agency radio receiver -> Issue ingest key",
-            "",
-        ]
-        if created:
-            lines += [
-                f"A settings file has been created for you at:",
-                f"  {CONFIG_PATH}",
-                "Open it, fill in the two values, save, and run this again.",
-            ]
-        else:
-            lines += [
-                f"Fill in the two values in:",
-                f"  {CONFIG_PATH}",
-                "then run this again. (Environment variables also work and take",
-                "precedence over the file.)",
-            ]
-        halt("\n".join(lines))
-
-    print(f"IronCAD SDR bridge - {SDR_BASE} -> {IRONCAD_API} every {POLL_SECONDS}s", flush=True)
-    print("receive only; transmit apps are never read", flush=True)
-
-    backoff = POLL_SECONDS
-    while _running:
-        started = time.time()
+def unconfigured_message():
+    created = False
+    if not os.path.exists(CONFIG_PATH):
         try:
-            cycle()
-            backoff = POLL_SECONDS
-        except requests.RequestException as exc:
-            # A flapping uplink must not turn into a tight retry loop against a
-            # rate-limited endpoint, so failures back off to a ceiling.
-            print(f"  cycle failed: {exc}", flush=True)
-            backoff = min(backoff * 2, 300)
-        elapsed = time.time() - started
-        for _ in range(int(max(1, backoff - elapsed))):
-            if not _running:
-                break
-            time.sleep(1)
+            with open(CONFIG_PATH, "w", encoding="utf-8") as handle:
+                handle.write(CONFIG_TEMPLATE)
+            created = True
+        except OSError as exc:
+            print(f"could not write {CONFIG_PATH}: {exc}", flush=True)
+    lines = [
+        "IronCAD SDR bridge is not configured yet.",
+        "",
+        "It needs your agency ID and an ingest key, both from IronCAD:",
+        "  Settings -> Agency radio receiver -> Issue ingest key",
+        "",
+    ]
+    if created:
+        lines += [
+            "A settings file has been created for you at:",
+            f"  {CONFIG_PATH}",
+            "Open it, fill in the two values, save, and run this again.",
+        ]
+    else:
+        lines += [
+            "Fill in the two values in:",
+            f"  {CONFIG_PATH}",
+            "then run this again. (Environment variables also work and take",
+            "precedence over the file.)",
+        ]
+    return "\n".join(lines)
 
-    print("stopped.", flush=True)
+
+def main(emit=None, report=None):
+    """
+    Run the bridge without a window.
+
+    emit and report default to the console. A windowed build has no console, so
+    the entry point passes file-backed versions instead; everything else about
+    this path is identical either way.
+    """
+    signal.signal(signal.SIGINT, _signal_stop)
+    signal.signal(signal.SIGTERM, _signal_stop)
+
+    emit = emit or console_emit
+    report = report or halt
+
+    cfg = build_config()
+    if not is_configured(cfg):
+        report(unconfigured_message())
+        return
+
+    run_loop(cfg, emit, lambda: _stopped)
 
 
 if __name__ == "__main__":
