@@ -260,6 +260,101 @@ def collect_packets(aprs_payload):
     return packets[:500]
 
 
+# Field names an appliance may use for "when this station was last heard".
+HEARD_FIELDS = ("heard_at", "last_heard", "lastheard", "last_seen",
+                "time", "timestamp", "received_at")
+
+# How long to remember that we have already seen a packet. Longer than any
+# sane beacon interval, short enough that the table cannot grow without bound
+# on a receiver that runs for weeks.
+PACKET_MEMORY_SECONDS = 3600
+
+# raw packet -> epoch seconds when this bridge first saw it.
+_first_seen = {}
+
+
+def reset_packet_memory():
+    """Forget every packet seen so far. For tests and for a restart of the loop."""
+    _first_seen.clear()
+
+
+def iso_utc(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def to_iso(value):
+    """
+    Normalise an appliance-supplied time, or return None if it is not one.
+
+    Appliances variously report epoch seconds, epoch milliseconds, or an ISO
+    string. Anything unrecognisable is rejected rather than guessed at, because
+    a wrong heard time is worse than none: the server falls back to our own
+    first-seen time, which is always sane.
+    """
+    if isinstance(value, (int, float)) and value > 0:
+        seconds = value / 1000.0 if value > 1e11 else float(value)
+        try:
+            return iso_utc(seconds)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str) and value.strip():
+        text = value.strip()
+        # Accept what the appliance gives if it looks like a date, and let the
+        # server do the real validation and future-clamping.
+        if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+            return text
+    return None
+
+
+def packet_heard_times(aprs_payload):
+    """The appliance's own heard time per raw packet, where it supplies one."""
+    times = {}
+    for row in as_list(aprs_payload, "packets", "stations", "results"):
+        if not isinstance(row, dict):
+            continue
+        raw = row.get("raw") or row.get("packet") or row.get("tnc2")
+        if not isinstance(raw, str):
+            continue
+        for field in HEARD_FIELDS:
+            iso = to_iso(row.get(field))
+            if iso:
+                times[raw] = iso
+                break
+    return times
+
+
+def stamp_packets(raws, now_epoch, appliance_times=None, seen=None):
+    """
+    Attach to each packet the time it was actually heard.
+
+    A receiver keeps reporting a station it is still listing, so the same
+    beacon is read on every poll. Sent as bare text, each arrival looked to the
+    server like a new transmission, and a responder who stopped transmitting
+    went on showing a current position. Remembering when we first saw a packet
+    means a re-report carries its original time and stops refreshing the pin.
+
+    The appliance's own time is preferred when it gives one, because it heard
+    the packet before we polled for it.
+    """
+    seen = _first_seen if seen is None else seen
+    appliance_times = appliance_times or {}
+    out = []
+    for raw in raws:
+        heard = appliance_times.get(raw)
+        if not heard:
+            heard = iso_utc(seen.setdefault(raw, now_epoch))
+        out.append({"raw": raw, "heard_at": heard})
+    return out
+
+
+def prune_packet_memory(now_epoch, max_age=PACKET_MEMORY_SECONDS, seen=None):
+    """Drop packets we have not seen for a while, so the table stays bounded."""
+    seen = _first_seen if seen is None else seen
+    for raw in [r for r, t in seen.items() if now_epoch - t > max_age]:
+        del seen[raw]
+    return len(seen)
+
+
 def push(cfg, body):
     headers = {
         "Content-Type": "application/json",
@@ -287,10 +382,18 @@ def cycle(cfg, emit):
     aircraft = get_local(cfg, ENDPOINTS["aircraft"], emit)
     weather = get_local(cfg, ENDPOINTS["weather"], emit)
 
+    now_epoch = time.time()
+    prune_packet_memory(now_epoch)
+
     body = {
         "site": cfg["site_label"],
         "observed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "aprs_packets": collect_packets(aprs),
+        # Objects rather than bare strings, each carrying when the packet was
+        # heard. A receiver re-reports a station it is still listing, and
+        # without a heard time every re-report refreshed the responder's pin.
+        "aprs_packets": stamp_packets(
+            collect_packets(aprs), now_epoch, packet_heard_times(aprs)
+        ),
         "aircraft": as_list(aircraft, "aircraft", "results"),
         "weather": as_list(weather, "sensors", "results"),
     }
