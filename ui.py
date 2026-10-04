@@ -42,7 +42,7 @@ from tkinter import messagebox
 
 import bridge
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # ---- the portal's palette, verbatim ---------------------------------------
 GROUND = "#0A0A0A"   # s-0, brand black
