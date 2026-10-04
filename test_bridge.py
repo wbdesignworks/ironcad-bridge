@@ -9,6 +9,7 @@ a station comes back from a power cut subtly wrong and nothing says so.
     python -m pytest test_bridge.py        (or: python test_bridge.py)
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -231,6 +232,88 @@ class LoopControl(unittest.TestCase):
         self.assertEqual(calls["n"], 2)
         self.assertIn("stopped.", said)
         self.assertTrue(any("receive only" in s for s in said))
+
+
+class HeardTimes(unittest.TestCase):
+    """
+    A receiver re-reports a station it is still listing. Without a heard time
+    every re-report refreshed the responder's pin on the map, so a person who
+    stopped transmitting never aged out. These cover the half of that fix that
+    lives in the bridge.
+    """
+
+    def setUp(self):
+        restore_real()
+        bridge.reset_packet_memory()
+
+    def tearDown(self):
+        bridge.reset_packet_memory()
+
+    def test_first_sighting_is_stamped_with_now(self):
+        out = bridge.stamp_packets(["A>B:c"], 1_000_000_000)
+        self.assertEqual(out[0]["raw"], "A>B:c")
+        self.assertEqual(out[0]["heard_at"], bridge.iso_utc(1_000_000_000))
+
+    def test_a_re_report_keeps_the_original_time(self):
+        """The whole point: seeing the same packet again must not move its time."""
+        first = bridge.stamp_packets(["A>B:c"], 1_000_000_000)
+        later = bridge.stamp_packets(["A>B:c"], 1_000_000_600)  # ten minutes on
+        self.assertEqual(first[0]["heard_at"], later[0]["heard_at"])
+
+    def test_a_genuinely_new_packet_gets_the_new_time(self):
+        bridge.stamp_packets(["A>B:c"], 1_000_000_000)
+        out = bridge.stamp_packets(["A>B:moved"], 1_000_000_600)
+        self.assertEqual(out[0]["heard_at"], bridge.iso_utc(1_000_000_600))
+
+    def test_the_appliance_time_wins_when_it_supplies_one(self):
+        out = bridge.stamp_packets(
+            ["A>B:c"], 1_000_000_600, {"A>B:c": "2026-10-04T12:00:00Z"})
+        self.assertEqual(out[0]["heard_at"], "2026-10-04T12:00:00Z")
+
+    def test_heard_times_are_read_from_the_shapes_appliances_use(self):
+        payload = {"stations": [
+            {"raw": "A>B:c", "last_heard": 1_000_000_000},
+            {"raw": "D>E:f", "heard_at": "2026-10-04T12:00:00Z"},
+            {"raw": "G>H:i", "time": 1_000_000_000_000},   # milliseconds
+            {"raw": "J>K:l"},                              # no time at all
+            {"raw": "M>N:o", "time": "nonsense"},          # unusable
+        ]}
+        times = bridge.packet_heard_times(payload)
+        self.assertEqual(times["A>B:c"], bridge.iso_utc(1_000_000_000))
+        self.assertEqual(times["D>E:f"], "2026-10-04T12:00:00Z")
+        self.assertEqual(times["G>H:i"], bridge.iso_utc(1_000_000_000))
+        self.assertNotIn("J>K:l", times)
+        self.assertNotIn("M>N:o", times)
+
+    def test_memory_is_pruned_so_it_cannot_grow_without_bound(self):
+        seen = {}
+        bridge.stamp_packets(["old>x:y"], 1_000_000_000, seen=seen)
+        bridge.stamp_packets(["new>x:y"], 1_000_003_000, seen=seen)
+        left = bridge.prune_packet_memory(1_000_003_000, max_age=600, seen=seen)
+        self.assertEqual(left, 1)
+        self.assertIn("new>x:y", seen)
+        self.assertNotIn("old>x:y", seen)
+
+    def test_the_cycle_sends_objects_carrying_heard_times(self):
+        cfg = {
+            "agency_id": "A1", "ingest_key": "k", "site_label": "",
+            "sdr_base": "http://127.0.0.1:5051/", "api": "https://api.example.test",
+            "poll_seconds": 5,
+        }
+        payload = {"stations": [{"raw": "N0CALL-9>APRS,TCPIP*:!4903.50N/07201.75W-"}]}
+        bridge.requests.get = lambda *a, **k: FakeResponse(200, payload)
+        sent = {}
+
+        def fake_post(url, headers=None, data=None, timeout=None):
+            sent.update(json.loads(data))
+            return FakeResponse(200, {"counts": {}})
+
+        bridge.requests.post = fake_post
+        bridge.cycle(cfg, lambda lv, t: None)
+        packets = sent["aprs_packets"]
+        self.assertEqual(len(packets), 1)
+        self.assertIn("raw", packets[0])
+        self.assertIn("heard_at", packets[0])
 
 
 class WindowlessOutput(unittest.TestCase):
