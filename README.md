@@ -107,6 +107,24 @@ locked, so what is on screen is what the bridge is running; editing it there
 would have no effect, and **Save settings** leaves it out of the file rather
 than turning a machine-level setting into a stored one.
 
+## Why the bridge sends a time with each packet
+
+A receiver keeps reporting a station it is still listing, so the same beacon is
+read on every poll. Until 1.2.0 the bridge sent bare packet text and the server
+stamped each arrival with the current time, which made one transmission look
+like a continuous stream of new positions. A responder who stopped transmitting
+went on showing a current position on the map, and the age shown beside their
+name read as seconds old however long ago they had actually keyed up.
+
+From 1.2.0 the bridge remembers when it first saw each packet and sends that
+time alongside it, preferring the appliance's own heard time when it reports
+one. The server uses that for the position's timestamp, so a re-reported beacon
+no longer refreshes the pin and a station that goes quiet ages out properly.
+
+**Upgrade the bridge to get this.** A 1.0.0 or 1.1.0 bridge sends bare text, and
+the server has nothing better to go on than arrival time, so the old behaviour
+continues until the bridge is replaced.
+
 ## Linking a responder to a callsign
 
 A packet only becomes a pin if its callsign is on the roster. Set each member's
